@@ -1,0 +1,535 @@
+---
+title: "GetTransactions"
+author: "Conor Flynn"
+date: "2023-04-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Define necessary libraries
+```{r}
+library(knitr)
+library(plyr)
+library(dplyr)
+library(jsonlite)
+library(stringr)
+library(tidyr)
+library(randomNames)
+```
+
+## Define request function:
+
+# NOTE:
+# This function is officially defined in DataEnginePrimaryFunctions.Rmd and does not need to be redefined
+# for every use-case. Here it is defined for and because there are requests made.
+
+# DESCRIPTION:
+# This function serves as the primary request point for making internal requests to the defi data engine. Note that should a request be
+# made outside the function, please ensure the necessary format depicted within it is used otherwise an internal error may occur.
+# Note that you MUST be connected to the RPI network (such that a connection can be made to defi-de.idea.rpi.edu) otherwise this
+# function will not work.
+
+# INPUT:
+#               - protocol:     The name of the protocol to receive data from.
+# [optional]    - properties:   All properties used in the call (note typically REST API URL parameters).
+# [optional]    - headers:      All headers used in the call (note typically REST API URL headers).
+# [optional]    - startdate:    Starting date to retrieve data from. In format 'yyyy-MM-dd' i.e. 2023-04-01
+# [optional]    - enddate:      Ending date to retrieve data from (non-inclusive). In format 'yyyy-MM-dd' i.e. 2023-04-01
+
+# OUTPUT:
+# list containing two elements:
+#               - $response:    Contains all response information as listed below:
+#                 - $response:  Value denoting status of call TO the engine. Code 200 denotes connection was received by engine properly. 
+#                 - $code:      Code returned by engine based on internal schema. Full list of codes can be found here (https://github.rpi.edu/DataINCITE/IDEA-DeFi-CRAFT/wiki/Response-Codes)
+#                 - $message:   Message response accompanying code should the response be irregular.
+#                 - $data:      Data returned by call should any be requested.
+```{r}
+request <- function(protocol, properties = "", headers = "", startdate = "", enddate = "") {
+  suppressWarnings({
+    #Create socket and get destination which tells the engine where to put the data
+    socket <- socketConnection("defi-de.idea.rpi.edu", 61200, blocking=TRUE)
+    destination <- readLines(socket, 1)
+    
+    formatted_properties = ""
+    if(properties != "")
+      formatted_properties = paste("properties", "&&&", properties, "&&&")
+    
+    formatted_headers = ""
+    if(headers != "")
+      formatted_headers = paste("headers", "&&&", headers, "&&&")
+    
+    formatted_startdate = ""
+    formatted_enddate = ""
+    if(startdate != "" && enddate != "") {
+      formatted_startdate = paste("start_date", "&&&", startdate, "&&&")
+      formatted_enddate = paste("end_date", "&&&", enddate, "&&&")
+    }
+    
+    #Build the request delimited by &&&
+    #Similar to a GET request in the way we handle parameters
+    request.raw <- paste(
+    				"SRC", "&&&", "RQST", "&&&",
+    				"type", "&&&", protocol, "&&&",
+    				formatted_properties,
+    				formatted_headers,
+    				formatted_startdate,
+    				formatted_enddate,
+    				"destination", "&&&", destination, "&&&",
+    				"\n", sep="")
+    
+    # remove all spaces from request
+    request.data <- str_replace_all(request.raw, " ", "")
+    
+    #Write this request back to the socket to tell engine what we want
+    writeLines(request.data, socket)
+    
+    # define a list which will store the individual rows
+    rows = list()
+    
+    #Now the engine will begin feeding us data
+    #We grab the first to initialize the data var and then we continue listening\
+    counter <- 0
+    response <- ""
+    while (TRUE) {
+      temp <- readLines(socket, 1)
+      
+      if(temp == '') 
+      {
+        print("Read empty string. Check engine logs or refresh configuration.")
+        next
+      }
+      
+      # if line is heartbeat then acknowledge and continue
+      if (grepl("<<<heartbeat>>>", temp, fixed=TRUE))
+      {
+        print(paste0("Heartbeat read for ", protocol))
+        next
+      }
+      
+      # if line is response then process and terminate
+      else if (grepl("<<<response>>>", temp, fixed=TRUE)) 
+      {
+        temp <- readLines(socket, 1)
+        while(grepl("<<<heartbeat>>>", temp, fixed=TRUE)) {
+          temp <- readLines(socket, 1)
+        }
+        response <- fromJSON(temp)
+        break
+      }
+      
+      # increment processed line counter
+      counter <- counter + 1
+      if(counter %% 1000 == 0){
+        print(paste0("Processed ", counter, " lines for ", protocol))
+      }
+      
+      # add data point line to data frame
+      tryCatch(expr={
+        rows[[counter]] = data.frame(fromJSON(temp))
+      },
+        error=function(e){
+        message("Heartbeat exception caught and not parsed.")    
+      })
+    }
+    
+    output <- list("response"=response, "df"=do.call(rbind.fill, rows))
+    close(socket)
+    return(output)
+  })
+}
+```
+
+
+## Define get_users function:
+
+# DESCRIPTION:
+# This function loads all user data from The Graph using the request() function defined above.
+# Only one call needs to be made to this function so long as the data is loaded in the cache.
+# Since it is a process-intensive call, it is recommended to only call this once and then
+# pass the output as a parameter to the get_data() function.
+
+# INPUT:
+
+# OUTPUT:
+# list containing two elements:
+#               - $response:    Contains all response information as listed below:
+#                 - $response:  Value denoting status of call TO the engine. Code 200 denotes connection was received by engine properly. 
+#                 - $code:      Code returned by engine based on internal schema. Full list of codes can be found here
+#                                 (https://github.rpi.edu/DataINCITE/IDEA-DeFi-CRAFT/wiki/Response-Codes)
+#                 - $message:   Message response accompanying code should the response be irregular.
+#                 - $data:      Data returned by call should any be requested.
+#               - $df:          Data frame containing data returned from 'graph-aave-users' request.
+```{r}
+get_users <- function() {
+  # retrieve users and then parse with aliases
+  graph.users <- request("graph-aave-users", "", "")
+  if(graph.users$response$code != 200)
+    return(graph.users)
+  
+  # define data frame
+  graph.users.df <- graph.users$df
+  
+  aliases = NULL
+  set.seed(69420)
+  
+  while(length(aliases[,1]) < length(graph.users.df$id)){
+    alias <- randomNames(1000, name.order = "first.last", name.sep = " ", sample.with.replacement = FALSE)
+    aliases <- aliases %>%
+      bind_rows(data.frame(alias)) %>%
+      distinct()
+  }
+  
+  aliases <- aliases %>%
+    head(length(graph.users.df$id))
+  
+  userAliases <- bind_cols(graph.users, aliases) %>%
+    mutate(version = "V2",
+           deployment = "Mainnet")
+  
+ output <- list("response"=graph.users$response, "df"=userAliases)
+}
+```
+
+
+## Define get_data function:
+
+# DESCRIPTION:
+# This function will request all necessary data to compute the transaction dataframe.
+# This includes multiple calls to The Graph which can be seen below.
+
+# INPUT:
+#               - startdate:    Starting date to retrieve data from. In format 'yyyy-MM-dd' i.e. 2023-04-01
+#               - enddate:      Ending date to retrieve data from (non-inclusive). In format 'yyyy-MM-dd' i.e. 2023-04-01
+#               - users:        Response from get_users() function that contains all user data. If not passed then it will
+#                                 request it in this function.
+
+# OUTPUT:
+# Dataframe containing all returned data.
+```{r}
+get_data <- function(startdate, enddate, users=NULL) {
+  ### retrieve all data from defi engine:
+  
+  # submit a request
+  graph.borrows <- request("graph-aave-borrows", "", "", startdate, enddate)
+  # for each request validate the code was successful
+  # if not the return the response with an empty dataframe
+  if(graph.borrows$response$code != 200)
+    return(graph.borrows)
+  
+  # repeat for all following requests
+  graph.collaterals <- request("graph-aave-collaterals", "", "", startdate, enddate)
+  if(graph.collaterals$response$code != 200)
+    return(graph.collaterals)
+  
+  graph.deposits <- request("graph-aave-deposits", "", "", startdate, enddate)
+  if(graph.deposits$response$code != 200)
+    return(graph.deposits)
+  
+  graph.flashloans <- request("graph-aave-flash-loans", "", "", startdate, enddate)
+  if(graph.flashloans$response$code != 200)
+    return(graph.flashloans)
+  
+  graph.liquidations <- request("graph-aave-liquidations", "", "", startdate, enddate)
+  if(graph.liquidations$response$code != 200)
+    return(graph.liquidations)
+  
+  graph.pricehist <- request("graph-aave-price-history-items", "", "", startdate, enddate)
+  if(graph.pricehist$response$code != 200)
+    return(graph.pricehist)
+  
+  graph.redeems <- request("graph-aave-redeems", "", "", startdate, enddate)
+  if(graph.redeems$response$code != 200)
+    return(graph.redeems)
+  
+  graph.repays <- request("graph-aave-repays", "", "", startdate, enddate)
+  if(graph.repays$response$code != 200)
+    return(graph.repays)
+  
+  graph.reservehist <- request("graph-aave-reserve-params-hist-items", "", "", startdate, enddate)
+  if(graph.reservehist$response$code != 200)
+    return(graph.reservehist)
+  
+  graph.reserves <- request("graph-aave-reserves", "", "")
+  if(graph.reserves$response$code != 200)
+    return(graph.reserves)
+  
+  graph.swaps <- request("graph-aave-swaps", "", "", startdate, enddate)
+  if(graph.swaps$response$code != 200)
+    return(graph.swaps)
+  
+  graph.userreserves <- request("graph-aave-user-reserves", "", "", startdate, enddate)
+  if(graph.userreserves$response$code != 200)
+    return(graph.userreserves)
+  
+  # retrieve users and then parse with aliases
+  graph.users <- users
+  if(is.null(users)) { 
+    # retrieve users and then parse with aliases
+    graph.users <- request("graph-aave-users", "", "")
+    if(graph.users$response$code != 200)
+      return(graph.users)
+    
+    # define data frame
+    graph.users.df <- graph.users$df
+    
+    aliases = NULL
+    set.seed(69420)
+    
+    while(length(aliases[,1]) < length(graph.users.df$id)){
+      alias <- randomNames(1000, name.order = "first.last", name.sep = " ", sample.with.replacement = FALSE)
+      aliases <- aliases %>%
+        bind_rows(data.frame(alias)) %>%
+        distinct()
+    }
+    
+    aliases <- aliases %>%
+      head(length(graph.users.df$id))
+    
+    userAliases <- bind_cols(graph.users, aliases) %>%
+      mutate(version = "V2",
+             deployment = "Mainnet")
+    
+    graph.users <- list("response"=graph.users$response, "df"=userAliases)
+  }
+  
+  # format into output list
+  output <- list(borrows=graph.borrows, collaterals=graph.collaterals, deposits=graph.deposits,
+                 flashloans=graph.flashloans, liquidations=graph.liquidations, pricehist=graph.pricehist,
+                 redeems=graph.redeems, repays=graph.repays, reservehist=graph.reservehist, reserves=graph.reserves,
+                 swaps=graph.swaps, userreserves=graph.userreserves, users=graph.users)
+}
+```
+
+## Define get_transactions function:
+
+# DESCRIPTION:
+# This function takes input returned from the get_data(startdate, enddate, users) function to parse a table with
+# all properly formatted transaction data.
+
+# INPUT:
+#               - data:       Response from the get_data() function containing all properly formatted data.
+
+# OUTPUT:
+# Dataframe containing all formatted transaction data.
+```{r}
+# get transactions function includes calls to both AmberData, GraphQL, and DeFiLlama
+get_transactions <- function(data) {
+  ### parse all data into proper raw naming conventions
+  
+  # load raw transaction tables:
+  rawBorrows <- data$borrows$df
+  rawCollaterals <- data$collaterals$df
+  rawDeposits <- data$deposits$df
+  rawLiquidations <- data$liquidations$df
+  rawRedeems <- data$redeems$df
+  rawRepays <- data$repays$df
+  rawSwaps <- data$swaps$df
+  rawFlashLoans <- data$flashloans$df
+  
+  # load raw reserve information:
+  rawReserveInfo <- data$reserves$df
+  rawReserveParamsHistory <- data$reservehist$df
+  
+  # select aliases
+  aliases <- data$users$df %>%
+    select(id, alias)
+  
+  # select reserve info
+  reserveInfo <- rawReserveInfo %>%
+    select(id,
+       symbol,
+       decimals)
+  
+  # select reserve parameter history
+  reserveParamsHistory <- rawReserveParamsHistory %>%
+    mutate(txID = str_sub(id, start = 1, end = 66)) %>%
+    left_join(reserveInfo, by = c("reserve" = "id"))
+  
+  # mutate and parse borrows df
+  borrows <- rawBorrows %>%
+    mutate(type = "borrow",
+           id = str_extract(id, "0x\\w+")) %>%
+    left_join(reserveParamsHistory, by = c("id" = "txID", "timestamp", "reserve")) %>%
+    mutate(amount = as.numeric(amount) / (10^as.numeric(decimals))) %>%
+    mutate(amountUSD = as.numeric(amount) * as.numeric(priceInUsd)) %>%
+    mutate(priceInEth = as.numeric(priceInEth) / (10^18)) %>%
+    mutate(amountETH = as.numeric(amount) * as.numeric(priceInEth)) %>%
+    mutate(reserve = symbol) %>%
+    mutate(user = user) %>%
+    mutate(onBehalfOf = caller) %>%
+    mutate(borrowRate = as.numeric(borrowRate) / (10^25)) %>%
+    mutate(pool = pool) %>%
+    left_join(aliases, by = c("user" = "id")) %>%
+    dplyr::rename(userAlias = alias) %>%
+    left_join(aliases, by = c("onBehalfOf" = "id")) %>%
+    dplyr::rename(onBehalfOfAlias = alias) %>%
+    select(id, type, timestamp, user, userAlias, onBehalfOf, onBehalfOfAlias, pool, 
+           reserve, amount, amountUSD, amountETH, borrowRate, borrowRateMode) %>%
+    drop_na() %>%
+    distinct()
+  
+  # mutate and parse collaterals df
+  collaterals <- rawCollaterals %>%
+    mutate(type = "collateral",
+           id = str_extract(id, "0x\\w+")) %>%
+    mutate(user = user, pool = pool) %>%
+    left_join(reserveParamsHistory, by = c("id" = "txID", "timestamp", "reserve")) %>%
+    mutate(reserve = symbol) %>%
+    left_join(aliases, by = c("user" = "id")) %>%
+    dplyr::rename(userAlias = alias) %>%
+    select(id, timestamp, user, userAlias, pool, reserve, fromState, toState, type) %>%
+    drop_na() %>%
+    distinct()
+  
+  # mutate and parse deposits df
+  deposits <- rawDeposits %>%
+    mutate(type = "deposit",
+           id = str_extract(id, "0x\\w+")) %>%
+    mutate(user = user, pool = pool) %>%
+    left_join(reserveParamsHistory, by = c("id" = "txID", "timestamp", "reserve")) %>%
+    mutate(reserve = symbol) %>%
+    mutate(onBehalfOf = caller) %>%
+    mutate(amount = as.numeric(amount) / (10^as.numeric(decimals))) %>%
+    mutate(amountUSD = as.numeric(amount) * as.numeric(priceInUsd)) %>%
+    mutate(priceInEth = as.numeric(priceInEth) / (10^18)) %>%
+    mutate(amountETH = as.numeric(amount) * as.numeric(priceInEth)) %>%
+    left_join(aliases, by = c("user" = "id")) %>%
+    dplyr::rename(userAlias = alias) %>%
+    left_join(aliases, by = c("onBehalfOf" = "id")) %>%
+    dplyr::rename(onBehalfOfAlias = alias) %>%
+    select(id, timestamp, type, amount, amountUSD, amountETH, reserve, user, userAlias, 
+           onBehalfOf, onBehalfOfAlias, pool) %>%
+    drop_na() %>%
+    distinct()
+  
+  # mutate and parse liquidations df
+  liquidations <- rawLiquidations %>%
+    mutate(type = "liquidation",
+           id = str_extract(id, "0x\\w+"),
+           user = user, pool = pool) %>%
+    left_join(reserveParamsHistory, by = c("id" = "txID", "principalReserve" = "reserve", "timestamp")) %>%
+    mutate(principalAmount = as.numeric(principalAmount) / 10^as.numeric(decimals),
+           principalAmountUSD = as.numeric(priceInUsd) * as.numeric(principalAmount),
+           principalAmountETH = as.numeric(priceInEth) * as.numeric(principalAmount) / 10^18) %>%
+    select(id, timestamp, type, user, liquidator, pool, 
+           principalAmount, principalReserve = symbol, principalAmountUSD, principalAmountETH, 
+           collateralAmount, collateralReserve) %>%
+    left_join(reserveParamsHistory, by = c("id" = "txID", "collateralReserve" = "reserve", "timestamp")) %>%
+    mutate(collateralAmount = as.numeric(collateralAmount) / 10^as.numeric(decimals),
+           collateralAmountUSD = as.numeric(priceInUsd) * as.numeric(collateralAmount),
+           collateralAmountETH = as.numeric(priceInEth) * as.numeric(collateralAmount) / 10^18) %>%
+    select(id, timestamp, type, user, liquidator, pool,
+           principalAmount, principalReserve, principalAmountUSD, principalAmountETH,
+           collateralAmount, collateralReserve = symbol, collateralAmountUSD, collateralAmountETH) %>%
+    left_join(aliases, by = c("user" = "id")) %>%
+    dplyr::rename(userAlias = alias) %>%
+    left_join(aliases, by = c("liquidator" = "id")) %>%
+    dplyr::rename(liquidatorAlias = alias) %>%
+    distinct()
+  
+  # mutate and parse redeems df
+  redeems <- rawRedeems %>%
+    mutate(type = "redeem",
+           id = str_extract(id, "0x\\w+")) %>%
+    mutate(user = user, pool = pool) %>%
+    left_join(reserveParamsHistory, by = c("id" = "txID", "timestamp", "reserve")) %>%
+    mutate(reserve = symbol) %>%
+    mutate(onBehalfOf = to) %>%
+    mutate(amount = as.numeric(amount) / (10^as.numeric(decimals))) %>%
+    mutate(amountUSD = as.numeric(amount) * as.numeric(priceInUsd)) %>%
+    mutate(priceInEth = as.numeric(priceInEth) / (10^18)) %>%
+    mutate(amountETH = as.numeric(amount) * as.numeric(priceInEth)) %>%
+    left_join(aliases, by = c("user" = "id")) %>%
+    dplyr::rename(userAlias = alias) %>%
+    left_join(aliases, by = c("onBehalfOf" = "id")) %>%
+    dplyr::rename(onBehalfOfAlias = alias) %>%
+    select(id,timestamp, type, amount, amountUSD, amountETH, reserve, user, userAlias, 
+          onBehalfOf, onBehalfOfAlias, priceInUsd, pool) %>%
+    drop_na() %>%
+    distinct()
+  
+  # mutate and parse repays df
+  repays <- rawRepays %>%
+    mutate(type = "repay",
+           id = str_extract(id, "0x\\w+"))%>%
+    mutate(user = user, pool = pool) %>%
+    left_join(reserveParamsHistory, by = c("id" = "txID", "timestamp", "reserve")) %>%
+    mutate(reserve = symbol) %>%
+    mutate(onBehalfOf = repayer) %>%
+    mutate(amount = as.numeric(amount) / (10^as.numeric(decimals))) %>%
+    mutate(amountUSD = as.numeric(amount) * as.numeric(priceInUsd)) %>%
+    mutate(priceInEth = as.numeric(priceInEth) / (10^18)) %>%
+    mutate(amountETH = as.numeric(amount) * as.numeric(priceInEth)) %>%
+    left_join(aliases, by = c("user" = "id")) %>%
+    dplyr::rename(userAlias = alias) %>%
+    left_join(aliases, by = c("onBehalfOf" = "id")) %>%
+    dplyr::rename(onBehalfOfAlias = alias) %>%
+    select(id, timestamp, type, amount, amountUSD, amountETH, reserve, user, userAlias, 
+           onBehalfOf, onBehalfOfAlias, priceInUsd, pool) %>%
+    drop_na() %>%
+    distinct()
+  
+  # mutate and parse swaps df
+  swaps <- rawSwaps %>%
+    mutate(type = "swap",
+           id = str_extract(id, "0x\\w+")) %>%
+    mutate(user = user, pool = pool) %>%
+    mutate(stableBorrowRate = as.numeric(stableBorrowRate) / (10^25), variableBorrowRate = as.numeric(variableBorrowRate) / (10^25)) %>%
+    left_join(reserveParamsHistory, by = c("id" = "txID", "timestamp", "reserve")) %>%
+    mutate(reserve = symbol) %>%
+    left_join(aliases, by = c("user" = "id")) %>%
+    dplyr::rename(userAlias = alias) %>%
+    select(id, timestamp, type, reserve, user, userAlias, pool, borrowRateModeTo, 
+           borrowRateModeFrom, stableBorrowRate = stableBorrowRate.x, variableBorrowRate = variableBorrowRate.x) %>%
+    drop_na() %>%
+    distinct()
+  
+  # mutate and parse flashloans df
+  flashLoans <- rawFlashLoans %>%
+    mutate(type = "flashLoan",
+           id = str_extract(id, "0x\\w+")) %>%
+    left_join(reserveParamsHistory, by = c("id" = "txID", "timestamp", "reserve")) %>%
+    mutate(reserve = symbol,
+           amount = as.numeric(amount)) %>%
+    select(id, timestamp, type, reserve, target, pool, amount, totalFee, target) %>%
+    drop_na() %>%
+    distinct()
+  
+  # define binded clean transactions df
+  cleanedTransactions <- borrows %>%
+    bind_rows(collaterals) %>%
+    bind_rows(deposits) %>%
+    bind_rows(liquidations) %>%
+    bind_rows(redeems) %>%
+    bind_rows(repays) %>%
+    bind_rows(swaps) %>%
+    bind_rows(flashLoans)
+  
+  # return successful output with given successful response code
+  output <- list("response"=list("code"=200, "data"="", "response"=200, "message"="Successful Response"), "df"=cleanedTransactions)
+  output
+}
+```
+
+
+## Sample Code:
+
+# First we make a request to get user data:
+```{r}
+users <- get_users()
+```
+
+# Next we write a call to get_data to get all needed data:
+```{r}
+startdate <-  "2022-01-01"
+enddate <-    "2022-01-10"
+data <-       get_data(startdate, enddate, users)
+```
+
+# Finally make a call to get all transactional data:
+```{r}
+transactions <- get_transactions(data)
+```

@@ -1,0 +1,154 @@
+---
+title: "Data Engine Primary Request Function"
+subtitle: "request function definition"
+author: "Conor Flynn"
+date: "04/18/2023"
+output:
+  pdf_document: default
+  html_document:
+    toc: true
+    number_sections: true
+    df_print: paged
+---
+# Start by loading the proper libraries:
+```{r setup, include=FALSE}
+library(knitr)
+library(plyr)
+library(dplyr)
+library(jsonlite)
+library(stringr)
+library(tidyr)
+```
+
+## Define request function:
+
+# DESCRIPTION:
+# This function serves as the primary request point for making internal requests to the defi data engine. Note that should a request be
+# made outside the function, please ensure the necessary format depicted within it is used otherwise an internal error may occur.
+# Note that you MUST be connected to the RPI network (such that a connection can be made to defi-de.idea.rpi.edu) otherwise this
+# function will not work.
+
+# INPUT:
+#               - protocol:     The name of the protocol to receive data from.
+# [optional]    - properties:   All properties used in the call (note typically REST API URL parameters).
+# [optional]    - headers:      All headers used in the call (note typically REST API URL headers).
+# [optional]    - startdate:    Starting date to retrieve data from. In format 'yyyy-MM-dd' i.e. 2023-04-01
+# [optional]    - enddate:      Ending date to retrieve data from (non-inclusive). In format 'yyyy-MM-dd' i.e. 2023-04-01
+
+# OUTPUT:
+# list containing two elements:
+#               - $response:    Contains all response information as listed below:
+#                 - $response:  Value denoting status of call TO the engine. Code 200 denotes connection was received by engine properly. 
+#                 - $code:      Code returned by engine based on internal schema. Full list of codes can be found here
+#                                 (https://github.rpi.edu/DataINCITE/IDEA-DeFi-CRAFT/wiki/Response-Codes)
+#                 - $message:   Message response accompanying code should the response be irregular.
+#                 - $data:      Data returned by call should any be requested.
+#               - $df:          Data frame containing all data parsed from the call.
+```{r}
+request <- function(protocol, properties = "", headers = "", startdate = "", enddate = "") {
+  suppressWarnings({
+    #Create socket and get destination which tells the engine where to put the data
+    socket <- socketConnection("defi-de.idea.rpi.edu", 61200, blocking=TRUE)
+    destination <- readLines(socket, 1)
+    
+    formatted_properties = ""
+    if(properties != "")
+      formatted_properties = paste("properties", "&&&", properties, "&&&")
+    
+    formatted_headers = ""
+    if(headers != "")
+      formatted_headers = paste("headers", "&&&", headers, "&&&")
+    
+    formatted_startdate = ""
+    formatted_enddate = ""
+    if(startdate != "" && enddate != "") {
+      formatted_startdate = paste("start_date", "&&&", startdate, "&&&")
+      formatted_enddate = paste("end_date", "&&&", enddate, "&&&")
+    }
+    
+    #Build the request delimited by &&&
+    #Similar to a GET request in the way we handle parameters
+    request.raw <- paste(
+    				"SRC", "&&&", "RQST", "&&&",
+    				"type", "&&&", protocol, "&&&",
+    				formatted_properties,
+    				formatted_headers,
+    				formatted_startdate,
+    				formatted_enddate,
+    				"destination", "&&&", destination, "&&&",
+    				"\n", sep="")
+    
+    # remove all spaces from request
+    request.data <- str_replace_all(request.raw, " ", "")
+    
+    #Write this request back to the socket to tell engine what we want
+    writeLines(request.data, socket)
+    
+    # define a list which will store the individual rows
+    rows = list()
+    
+    #Now the engine will begin feeding us data
+    #We grab the first to initialize the data var and then we continue listening\
+    counter <- 0
+    response <- ""
+    while (TRUE) {
+      temp <- readLines(socket, 1)
+      
+      if(temp == '') 
+      {
+        print("Read empty string. Check engine logs or refresh configuration.")
+        next
+      }
+      
+      # if line is heartbeat then acknowledge and continue
+      if (grepl("<<<heartbeat>>>", temp, fixed=TRUE))
+      {
+        print(paste0("Heartbeat read for ", protocol))
+        next
+      }
+      
+      # if line is response then process and terminate
+      else if (grepl("<<<response>>>", temp, fixed=TRUE)) 
+      {
+        temp <- readLines(socket, 1)
+        while(grepl("<<<heartbeat>>>", temp, fixed=TRUE)) {
+          temp <- readLines(socket, 1)
+        }
+        response <- fromJSON(temp)
+        break
+      }
+      
+      # increment processed line counter
+      counter <- counter + 1
+      if(counter %% 1000 == 0){
+        print(paste0("Processed ", counter, " lines for ", protocol))
+      }
+      
+      # add data point line to data frame
+      tryCatch(expr={
+        rows[[counter]] = data.frame(fromJSON(temp))
+      },
+        error=function(e){
+        message("Heartbeat exception caught and not parsed.")    
+      })
+    }
+    
+    output <- list("response"=response, "df"=do.call(rbind.fill, rows))
+    close(socket)
+    return(output)
+  })
+}
+```
+
+## Sample function call to the protocol graph-aave-borrows
+```{r}
+startdate <- "2022-01-01"
+enddate <- "2022-01-04"
+
+# submit a request
+graph.borrows <- request("graph-aave-borrows", "", "", startdate, enddate)
+# for each request validate the code was successful
+# if not the return the response with an empty dataframe
+if(graph.borrows$response$code != 200)
+  return(graph.borrows)
+```

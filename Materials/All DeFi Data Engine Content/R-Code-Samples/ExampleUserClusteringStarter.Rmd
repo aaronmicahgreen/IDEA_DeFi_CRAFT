@@ -1,0 +1,450 @@
+---
+title: 'User Clustering Start Example'
+author: "Your Name Here"
+subtitle: "Making Users from Transaction Data and Clustering"
+output:
+  pdf_document: default
+  html_document: default
+  header-includes: \usepackage{color}
+  toc: yes
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+library(ggplot2)
+library(knitr)
+library(plyr)
+library(dplyr)
+library(jsonlite)
+library(RColorBrewer)
+library(tidyverse)
+library(beeswarm)
+library(ggbeeswarm)
+library(xts)
+library(plotly)
+library(lubridate)
+library(survival)
+library(survminer)
+library(ranger)
+library(ggfortify)
+library(factoextra)
+library(cluster)
+library(fclust)
+library(ppclust)
+library(e1071)
+library(randomNames)
+```
+
+## Define request function:
+
+# NOTE:
+# This function is officially defined in DataEnginePrimaryFunctions.Rmd and does not need to be redefined
+# for every use-case. Here it is defined for and because there is a request made.
+
+# DESCRIPTION:
+# This function serves as the primary request point for making internal requests to the defi data engine. Note that should a request be
+# made outside the function, please ensure the necessary format depicted within it is used otherwise an internal error may occur.
+# Note that you MUST be connected to the RPI network (such that a connection can be made to defi-de.idea.rpi.edu) otherwise this
+# function will not work.
+
+# INPUT:
+#               - protocol:     The name of the protocol to receive data from.
+# [optional]    - properties:   All properties used in the call (note typically REST API URL parameters).
+# [optional]    - headers:      All headers used in the call (note typically REST API URL headers).
+# [optional]    - startdate:    Starting date to retrieve data from. In format 'yyyy-MM-dd' i.e. 2023-04-01
+# [optional]    - enddate:      Ending date to retrieve data from (non-inclusive). In format 'yyyy-MM-dd' i.e. 2023-04-01
+
+# OUTPUT:
+# list containing two elements:
+#               - $response:    Contains all response information as listed below:
+#                 - $response:  Value denoting status of call TO the engine. Code 200 denotes connection was received by engine properly. 
+#                 - $code:      Code returned by engine based on internal schema. Full list of codes can be found here
+#                                 (https://github.rpi.edu/DataINCITE/IDEA-DeFi-CRAFT/wiki/Response-Codes)
+#                 - $message:   Message response accompanying code should the response be irregular.
+#                 - $data:      Data returned by call should any be requested.
+#               - $df:          Data frame containing all data parsed from the call.
+```{r}
+request <- function(protocol, properties = "", headers = "", startdate = "", enddate = "") {
+  suppressWarnings({
+    #Create socket and get destination which tells the engine where to put the data
+    socket <- socketConnection("defi-de.idea.rpi.edu", 61200, blocking=TRUE)
+    destination <- readLines(socket, 1)
+    
+    formatted_properties = ""
+    if(properties != "")
+      formatted_properties = paste("properties", "&&&", properties, "&&&")
+    
+    formatted_headers = ""
+    if(headers != "")
+      formatted_headers = paste("headers", "&&&", headers, "&&&")
+    
+    formatted_startdate = ""
+    formatted_enddate = ""
+    if(startdate != "" && enddate != "") {
+      formatted_startdate = paste("start_date", "&&&", startdate, "&&&")
+      formatted_enddate = paste("end_date", "&&&", enddate, "&&&")
+    }
+    
+    #Build the request delimited by &&&
+    #Similar to a GET request in the way we handle parameters
+    request.raw <- paste(
+    				"SRC", "&&&", "RQST", "&&&",
+    				"type", "&&&", protocol, "&&&",
+    				formatted_properties,
+    				formatted_headers,
+    				formatted_startdate,
+    				formatted_enddate,
+    				"destination", "&&&", destination, "&&&",
+    				"\n", sep="")
+    
+    # remove all spaces from request
+    request.data <- str_replace_all(request.raw, " ", "")
+    
+    #Write this request back to the socket to tell engine what we want
+    writeLines(request.data, socket)
+    
+    # define a list which will store the individual rows
+    rows = list()
+    
+    #Now the engine will begin feeding us data
+    #We grab the first to initialize the data var and then we continue listening\
+    counter <- 0
+    response <- ""
+    while (TRUE) {
+      temp <- readLines(socket, 1)
+      
+      if(temp == '') 
+      {
+        print("Read empty string. Check engine logs or refresh configuration.")
+        next
+      }
+      
+      # if line is heartbeat then acknowledge and continue
+      if (grepl("<<<heartbeat>>>", temp, fixed=TRUE))
+      {
+        print(paste0("Heartbeat read for ", protocol))
+        next
+      }
+      
+      # if line is response then process and terminate
+      else if (grepl("<<<response>>>", temp, fixed=TRUE)) 
+      {
+        temp <- readLines(socket, 1)
+        while(grepl("<<<heartbeat>>>", temp, fixed=TRUE)) {
+          temp <- readLines(socket, 1)
+        }
+        response <- fromJSON(temp)
+        break
+      }
+      
+      # increment processed line counter
+      counter <- counter + 1
+      if(counter %% 1000 == 0){
+        print(paste0("Processed ", counter, " lines for ", protocol))
+      }
+      
+      # add data point line to data frame
+      tryCatch(expr={
+        rows[[counter]] = data.frame(fromJSON(temp))
+      },
+        error=function(e){
+        message("Heartbeat exception caught and not parsed.")    
+      })
+    }
+    
+    output <- list("response"=response, "df"=do.call(rbind.fill, rows))
+    close(socket)
+    return(output)
+  })
+}
+```
+
+# Load the transaction data from IDEA:
+```{r}
+# These are the generic names for the files with the associated information for all AAVE deployments:
+
+# retrieve stable coins from defillama
+stablecoins <- request("llama-stablecoins", "", "")$df
+
+# Load the mainnet data:
+mainnetTransactions <- transactions$df
+mainnetReserveInfo <- data$reserves$df %>%
+                      mutate(reserveType = case_when(symbol %in% stablecoins$symbol ~ "Stable",
+                                                  TRUE ~ "Non-Stable"))
+
+mainnetTransactions <- mainnetTransactions %>%
+  mutate(timestamp=as.numeric(timestamp)) %>%
+  mutate(datetime = as_datetime(timestamp))
+
+df <- mainnetTransactions
+```
+
+# Clustering Users:
+
+  One goal of this project is to characterize users by their behavior within the DeFi ecosystem. For now, that just means characterizing them by their behavior within AAVE. Since we only have transaction data, we need to use this transaction data to create user-level data that can be actually be used for clustering, or perhaps other behavior-characterization methods. To help with the creation of these features, we start by separating our transactions into different dataframes for each transaction type and doing some aggregation of liquidations to help better characterize liquidation events.
+  
+## Build some helper dataframes:
+```{r, warning=FALSE}
+not_all_na <- function(x) any(!is.na(x))
+`%notin%` <- Negate(`%in%`)
+
+borrows <- df %>%
+  filter(type == "borrow") %>%
+  select(where(not_all_na))
+
+repays <- df %>%
+  filter(type == "repay") %>%
+  select(where(not_all_na))
+
+deposits <- df %>%
+  filter(type == "deposit") %>%
+  select(where(not_all_na))
+
+redeems <- df %>%
+  filter(type == "redeem") %>%
+  select(where(not_all_na))
+
+liquidations <- df %>%
+  filter(type == "liquidation") %>%
+  select(where(not_all_na))
+
+swaps <- df %>%
+  filter(type == "swap") %>%
+  select(where(not_all_na))
+
+collaterals <- df %>%
+  filter(type == "collateral") %>%
+  select(where(not_all_na))
+
+liquidationsPerformed <- liquidations %>%
+  mutate(liquidatee = user, liquidateeAlias = userAlias) %>%
+  select(-user, -userAlias) %>%
+  rename(user = liquidator, userAlias = liquidatorAlias)
+
+reserveTypes <- mainnetReserveInfo %>%
+                  select(reserve=symbol, reserveType)
+
+df2 <- left_join(df, reserveTypes, by="reserve") %>%
+  mutate(timestamp=as.numeric(timestamp)) %>%
+  distinct()
+
+numLiqPerUser <- liquidations %>%
+  group_by(user) %>%
+  dplyr::summarise(numLiquidations = n())
+
+
+aggregateLiquidations <- df2 %>%
+  filter(user %in% numLiqPerUser$user) %>% # First, let's filter out all users who have never been liquidated.
+  group_by(user) %>%                       # The next set of logic is to sort users' transactions by timestamp and pull out all liquidations that are
+  arrange(timestamp) %>%                   # part of a consecutive set of liquidations.
+  mutate(nextTransaction = lead(type)) %>%
+  mutate(prevTransaction = lag(type)) %>%
+  filter(type == "liquidation" & (nextTransaction == "liquidation" | prevTransaction == "liquidation"))  %>%
+  mutate(liquidationDay = floor_date(as_datetime(timestamp), unit = "day")) %>% # Then we want to use some approximation for the timeframe of this liquidation event, so we naively group consecutive liquidations by the day on which they took place.
+  group_by(user,liquidationDay) %>% # Doing this means that we can group by user and liquidationDay, which is functionally grouping by "liquidation event"
+  mutate(liquidationDuration = max(timestamp) - min(timestamp)) %>% # Now we can compute some basic stats about the event.
+  mutate(liquidationStart = min(timestamp), liquidationEnd = max(timestamp)) %>%
+  mutate(liquidationStartDatetime = as_datetime(liquidationStart), liquidationEndDatetime = as_datetime(liquidationEnd)) %>%
+  mutate(reserve = collateralReserve) %>%
+  left_join(reserveTypes, by = "reserve") %>%
+  dplyr::rename(collateralType = reserveType.y) %>%
+  mutate(reserve = principalReserve) %>%
+  left_join(reserveTypes, by = "reserve") %>%
+  dplyr::rename(principalType = reserveType) %>%
+  mutate(totalCollateralUSD = sum(collateralAmountUSD), totalPrincipalUSD = sum(principalAmountUSD))%>%
+  dplyr::mutate(numLiquidations = n()) %>%
+  dplyr::summarise(userAlias, numLiquidations, liquidationDuration, liquidationStart, liquidationEnd, liquidationStartDatetime, liquidationEndDatetime,
+            collateralReserves = str_flatten(str_sort(unique(collateralReserve)), collapse = ","), 
+            collateralTypes = str_flatten(str_sort(unique(collateralType)), collapse= ","),
+            principalReserves = str_flatten(str_sort(unique(principalReserve)), collapse = ","),
+            principalTypes = str_flatten(str_sort(unique(principalType)), collapse = ","),
+            totalCollateralUSD, totalPrincipalUSD, liquidationType = str_c(principalTypes, collateralTypes, sep = ":")) %>%
+  distinct()
+
+rm(df2)
+
+```
+  
+
+## Build features to cluster the users:
+```{r, warning=FALSE}
+timeFinal <- max(df$timestamp)
+userActiveTime <- df %>%
+  group_by(user) %>%
+  dplyr::summarise(firstTransactionTimestamp = min(timestamp), finalTimestamp = max(timestamp), daysSinceFirstTransaction = max((timeFinal-min(timestamp))/86400, 1))
+
+userDailyTransactions <- df %>%
+  group_by(user) %>%
+  mutate(transactionDay = floor_date(as_datetime(timestamp), unit = "day")) %>%
+  group_by(user, transactionDay) %>%
+  dplyr::summarise(transactionsPerActiveDay = n())
+
+userActiveDays <- userDailyTransactions %>%
+  group_by(user) %>%
+  dplyr::summarise(activeDays = n())
+
+userBorrowCounts <- borrows %>%
+  group_by(user) %>%
+  dplyr::summarise(borrowCount = n(), borrowValue = sum(amountUSD)) %>%
+  mutate(logBorrowValue = case_when(borrowValue != 0 ~ log(borrowValue, 10), 
+                                    TRUE ~ 0))
+
+userDepositCounts <- deposits %>%
+  group_by(user) %>%
+  dplyr::summarise(depositCount = n(), depositValue = sum(amountUSD))%>%
+  mutate(logDepositValue = case_when(depositValue != 0 ~ log(depositValue, 10), 
+                                    TRUE ~ 0))
+
+userRedeemCounts <- redeems %>%
+  group_by(user) %>%
+  dplyr::summarise(redeemCount = n(), redeemValue = sum(amountUSD)) %>%
+  mutate(logRedeemValue = case_when(redeemValue != 0 ~ log(redeemValue, 10), 
+                                    TRUE ~ 0))
+
+userRepayCounts <- repays %>%
+  group_by(user) %>%
+  dplyr::summarise(repayCount = n(), repayValue = sum(amountUSD)) %>%
+  mutate(logRepayValue = case_when(repayValue != 0 ~ log(repayValue, 10), 
+                                    TRUE ~ 0))
+
+userLiquidatedCounts <- aggregateLiquidations %>%
+  group_by(user) %>%
+  dplyr::summarise(liquidatedCount = n(), liquidatedValue = sum(totalPrincipalUSD))
+
+userLiquidationCounts <- liquidationsPerformed %>%
+  group_by(user) %>%
+  dplyr::summarise(liquidationsPerformed = n(), liquidationsPerformedValue = sum(collateralAmountUSD))
+
+userSwapCounts <- swaps %>%
+  group_by(user) %>%
+  dplyr::summarise(swapCount = n())
+
+userCollateralCounts <- collaterals %>%
+  group_by(user) %>%
+  dplyr::summarise(collateralCount = n())
+
+userReservesUsed <- df %>%
+  filter(type == "deposit" | type == "borrow") %>%
+  group_by(user) %>%
+  dplyr::summarise(reservesUsed = n_distinct(reserve))
+
+transactionsMadeOnBehalfOf <- df %>%
+  filter(user != onBehalfOf) %>%
+  select(onBehalfOf) %>%
+  rename(user = onBehalfOf) %>%
+  group_by(user) %>%
+  summarise(onBehalfOfCount = n())
+  
+transactionsPerformedForOther <- df %>%
+  filter(user != onBehalfOf) %>%
+  select(user) %>%
+  group_by(user) %>%
+  summarise(performedForOtherCount = n())
+
+
+userTransactionCounts <- df %>%
+  select(user) %>%
+  distinct() %>%
+  full_join(userBorrowCounts, by = "user") %>%
+  full_join(userDepositCounts, by = "user") %>%
+  full_join(userRedeemCounts, by = "user") %>%
+  full_join(userRepayCounts, by = "user") %>%
+  full_join(userLiquidatedCounts, by = "user") %>%
+  full_join(userLiquidationCounts, by = "user") %>%
+  full_join(userSwapCounts, by = "user") %>%
+  full_join(userCollateralCounts, by = "user")
+
+userTransactionCounts[is.na(userTransactionCounts)] = 0
+
+userTransactionCounts <- userTransactionCounts %>%
+  mutate(totalTransactionCount = borrowCount + depositCount + redeemCount + repayCount + liquidatedCount + liquidationsPerformed + swapCount + collateralCount)
+
+userActiveCollaterals <- collaterals %>%
+  group_by(user, reserve) %>%
+  slice_max(timestamp) %>%
+  filter(toState == TRUE) %>%
+  ungroup() %>%
+  group_by(user) %>%
+  dplyr::summarise(numActiveCollaterals=n())
+
+userClusteringData <- userTransactionCounts %>%
+  mutate(percentDepositRedeem = (depositCount + redeemCount) / totalTransactionCount) %>%
+  mutate(averageUSDPerTransaction = (depositValue + redeemValue + repayValue + liquidatedValue + liquidationsPerformedValue + borrowValue) / totalTransactionCount) %>%
+  mutate(logUSDPerTransaction = case_when(averageUSDPerTransaction != 0 ~ log(averageUSDPerTransaction, 10), TRUE ~ 0)) %>%
+  mutate(timesLiquidated = liquidatedCount) %>%
+  mutate(liquidationsPerformed = liquidationsPerformed) %>%
+  left_join(userActiveTime, by="user") %>%
+  mutate(averageTransactionsPerDay = totalTransactionCount / daysSinceFirstTransaction) %>%
+  left_join(userActiveDays, by="user") %>%
+  mutate(percentageDaysActive = activeDays / daysSinceFirstTransaction) %>%
+  left_join(userReservesUsed, by = "user") %>%
+  left_join(userActiveCollaterals, by="user") %>%
+  mutate(percentDeposit = depositCount / totalTransactionCount, percentRedeems = redeemCount / totalTransactionCount, 
+         percentBorrow = borrowCount / totalTransactionCount, percentRepay = repayCount / totalTransactionCount,
+         percentSwap = swapCount / totalTransactionCount, percentCollateral = collateralCount / totalTransactionCount,
+         percentLiquidations = liquidationsPerformed / totalTransactionCount) %>%
+  left_join(transactionsMadeOnBehalfOf, by="user") %>%
+  left_join(transactionsPerformedForOther, by = "user")
+  
+userClusteringData[is.na(userClusteringData)] = 0
+```
+# Computing K-Means clusters for these users:
+
+```{r, warning=FALSE}
+# First, let's select the features we want to use, because we might not want to use them all.
+clusteringFeatures <- userClusteringData %>%
+  select(percentDeposit, percentRedeems, percentCollateral, percentBorrow, percentRepay, percentLiquidations, percentSwap, daysSinceFirstTransaction, logDepositValue, logRedeemValue, logBorrowValue, logRepayValue)
+
+# Don't forget to scale the data ahead of time:
+scaledData <- clusteringFeatures %>% mutate_all(scale)
+
+kmeansClusters <- kmeans(scaledData, centers = 4, nstart = 25)
+
+fviz_cluster(kmeansClusters, data = scaledData)
+```
+
+```{r}
+clusteredUsers <- userClusteringData %>%
+  bind_cols(cluster = kmeansClusters$cluster) %>%
+  select(user, cluster)
+
+transactionsWithClusters <- mainnetTransactions %>%
+  left_join(clusteredUsers, by = "user") %>%
+  filter(type %in% c("liquidation", "redeem", "borrow", "repay", "deposit"))
+
+transactionsByClusterPlot <- ggplot(data = transactionsWithClusters, aes(x = datetime, group = type, color = type)) + 
+  geom_density() + facet_wrap( ~ cluster) + 
+  ggtitle("Transaction Types Over Time by User Cluster") 
+
+transactionsByClusterPlot
+
+usersPerCluster <- clusteredUsers %>%
+  group_by(cluster) %>%
+  summarize(count = n())
+```
+
+
+# Choose the appropriate amount of clusters using the "elbow" method:
+```{r, warning=FALSE}
+set.seed(123)
+
+fviz_nbclust(head(scaledData, 10000), kmeans, method = "wss")
+```
+  It looks like the "elbow" occurs at 3, so let's run k-means with 3 centers and see what the clusters look like with respect to the first two principal components.
+```{r, warning=FALSE}
+  
+kmeansClusters <- kmeans(scaledData, centers = 3, nstart=25)
+
+fviz_cluster(kmeansClusters, data = scaledData)
+```
+
+  It's hard to know from this visualization whether these clusters are meaningful. The principal components do not explain that much variance of the data. Given that K-means is among the most naive clustering methods, it's likely a good idea to explore other clustering methods. Additionally, the selected features for the above clustering were not necessarily selected in a smart way. 
+  
+# Future Work and Questions:
+
+  1. Can you think of other features that could be meaningful for clustering and characterizing users? If so, can you build those features from the transaction data?
+  
+  2. Try some feature selection techniques to figure out which features of those computed above should actually be used in the clustering.
+  
+  3. Implement more complex clustering methods for clustering the users.
+  
+  4. Compare user behavior by clusters across deployments of AAVE. How do users behave differently between the Ethereum mainnet deployment and the Matic deployment?

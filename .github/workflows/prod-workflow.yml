@@ -1,0 +1,37 @@
+name: prod-workflow
+on:
+  push:
+    branches: [ main ]
+    paths: 'All DeFi Data Engine Content/DeFi-Data-Engine/**'
+  workflow_dispatch:
+
+jobs:
+  buildDocker:
+    runs-on: [ self-hosted ]
+    defaults:
+      run:
+        working-directory: "All DeFi Data Engine Content/DeFi-Data-Engine/"
+        
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Stop Existing Images
+      run: docker compose down
+         
+    - name: Build
+      run: docker compose build
+  
+  runDocker:
+    needs: buildDocker
+    runs-on: [ self-hosted ]
+    
+    defaults:
+      run:
+        working-directory: "All DeFi Data Engine Content/DeFi-Data-Engine/"
+        
+    steps:
+    - name: Create Containers
+      run: docker compose create
+
+    - name: Start services
+      run: docker compose start

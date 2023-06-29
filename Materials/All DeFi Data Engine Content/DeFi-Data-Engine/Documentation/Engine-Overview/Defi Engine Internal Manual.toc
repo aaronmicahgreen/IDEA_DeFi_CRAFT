@@ -1,0 +1,21 @@
+\contentsline {section}{\numberline {1}Abstract}{3}{section.1}%
+\contentsline {section}{\numberline {2}Stack}{3}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Java}{3}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}Cap'n Proto}{3}{subsection.2.2}%
+\contentsline {section}{\numberline {3}Data Core}{4}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Overview}{4}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Packets}{4}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Controller Connection}{4}{subsection.3.3}%
+\contentsline {subsubsection}{\numberline {3.3.1}Management}{4}{subsubsection.3.3.1}%
+\contentsline {subsubsection}{\numberline {3.3.2}Request Formatting}{5}{subsubsection.3.3.2}%
+\contentsline {subsubsection}{\numberline {3.3.3}Response Formatting}{6}{subsubsection.3.3.3}%
+\contentsline {subsection}{\numberline {3.4}Processes}{6}{subsection.3.4}%
+\contentsline {subsubsection}{\numberline {3.4.1}Router Superclass}{6}{subsubsection.3.4.1}%
+\contentsline {subsubsection}{\numberline {3.4.2}Core}{8}{subsubsection.3.4.2}%
+\contentsline {subsubsection}{\numberline {3.4.3}Stream Manager}{10}{subsubsection.3.4.3}%
+\contentsline {subsubsection}{\numberline {3.4.4}External Stream Handler}{11}{subsubsection.3.4.4}%
+\contentsline {subsubsection}{\numberline {3.4.5}Historical Stream Handler}{12}{subsubsection.3.4.5}%
+\contentsline {subsection}{\numberline {3.5}Internal Language}{13}{subsection.3.5}%
+\contentsline {subsubsection}{\numberline {3.5.1}Management Processes}{13}{subsubsection.3.5.1}%
+\contentsline {subsubsection}{\numberline {3.5.2}External Stream Requests}{13}{subsubsection.3.5.2}%
+\contentsline {subsubsection}{\numberline {3.5.3}Historical Stream Requests}{14}{subsubsection.3.5.3}%

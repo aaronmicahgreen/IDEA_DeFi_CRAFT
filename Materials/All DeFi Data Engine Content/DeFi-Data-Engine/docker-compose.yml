@@ -1,0 +1,33 @@
+version: "3.9"
+services:
+  mongodb_container:
+    image: mongo:latest
+    ports:
+      - 27017:27017
+    volumes:
+      - mongodb_data_container:/data/db
+    hostname: MONGO
+  dataengine:
+    build:
+      context: "DeFi Data Engine"
+    image: dataincite/defi-data-engine:latest
+    depends_on:
+      - mongodb_container
+    ports:
+      - 61100:61100
+      - 61200:61200
+    hostname: DataEngine
+  # restapp:
+  #   build:
+  #     context: "Rest Application"
+  #   image: dataincite/data-engine-rest-app:latest
+  #   depends_on:
+  #     - dataengine
+  #   ports:
+  #     - 8080:8080
+  #   hostname: RestApp
+
+
+
+volumes:
+  mongodb_data_container:
